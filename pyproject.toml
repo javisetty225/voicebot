@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "voicebot"
+version = "0.1.0"
+description = "German speech transcription and keyword detection voicebot with Flask backend and Streamlit frontend."
+readme = "README.md"
+requires-python = "==3.12.10"
+authors = [
+  { name = "Nagaraju Javisetty", email = "nagajavisetty143@gmail.com" }
+]
+
+dependencies = [
+  # Backend dependencies
+  "Flask",
+  "torch",
+  "transformers",
+  "pydub",
+
+  # Frontend dependencies
+  "streamlit",
+  "requests",
+  "streamlit-audiorecorder",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["frontend", "backend"]
+
+[project.urls]
+Homepage = "https://example.com/voicebot"
