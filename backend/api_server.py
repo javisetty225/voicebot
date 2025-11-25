@@ -3,99 +3,166 @@ import time
 import json
 import logging
 import tempfile
-from flask import Flask, request, jsonify
+import re
+from functools import lru_cache
+from typing import List, Dict
+from contextlib import asynccontextmanager
+
 import torch
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from transformers import pipeline
 from pydub import AudioSegment
 
-app = Flask(__name__)
+MODEL_NAME = os.getenv("ASR_MODEL", "bofenghuang/whisper-medium-cv11-german")
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
+ALLOWED_EXT = {".wav", ".mp3"}
+KEYWORDS_PATH = os.getenv("KEYWORDS_PATH", os.path.join(os.path.dirname(__file__), "keywords.json"))
+PIPELINE_TASK = "automatic-speech-recognition"
+
+logger = logging.getLogger("voicebot")
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+keyword_set: set[str] = set()
+keywords_raw: List[str] = []
+word_pattern = re.compile(r"\b[\wäöüÄÖÜß]+\b", re.UNICODE)
 
-# Setup logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
+class TranscribeResponse(BaseModel):
+    text: str
+    keywords: List[str]
+    timings: Dict[str, float]
 
-# Load pipeline
-try:
-    pipe = pipeline("automatic-speech-recognition", model="bofenghuang/whisper-medium-cv11-german", device=device)
-    pipe.model.config.forced_decoder_ids = pipe.tokenizer.get_decoder_prompt_ids(language="de", task="transcribe")
-    logger.info("Model loaded successfully")
-except Exception as e:
-    logger.error(f"Error loading model: {e}")
-    raise e
+class KeywordsResponse(BaseModel):
+    keywords: List[str]
 
-# Load keywords from config
-try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    KEYWORDS_PATH = os.path.join(BASE_DIR, "keywords.json")
-    with open(KEYWORDS_PATH, encoding="utf-8") as f:
-        keywords = json.load(f)["keywords"]
-    keyword_set = {k.lower() for k in keywords}
-    logger.info("Keywords loaded successfully")
-except Exception as e:
-    logger.error(f"Error loading keywords: {e}")
-    raise e
+class HealthResponse(BaseModel):
+    status: str
+    model: str
+    device: str
 
-def transcribe_audio(file_path):
-    """Transcribes audio from the given file path."""
+def load_keywords() -> None:
+    global keyword_set, keywords_raw
     try:
-        generated_sentences = pipe(file_path)["text"]
-        return generated_sentences
-    except Exception as e:
-        logger.error(f"Error during transcription: {e}")
-        raise e
+        with open(KEYWORDS_PATH, encoding="utf-8") as f:
+            keywords_raw = json.load(f).get("keywords", [])
+        keyword_set = {k.lower() for k in keywords_raw}
+        logger.info("Loaded %d keywords", len(keyword_set))
+    except Exception:
+        logger.exception("Failed to load keywords")
+        keyword_set = set()
+        keywords_raw = []
 
-def detect_keywords(text: str) -> list[str]:
-    """Detects and returns keywords present in the given text."""
-    detected: list[str] = []
-    for word in text.split():
-        cleaned_word = word.strip(".,!?:;").lower()
-        if cleaned_word in keyword_set:
-            detected.append(word.strip(".,!?:;"))  # Preserve original case
-    return detected
-
-@app.route('/transcribe', methods=['POST'])
-def transcribe():
-    """Endpoint to transcribe audio and detect keywords."""
-    start_time = time.time()
+@lru_cache(maxsize=1)
+def get_asr_pipeline():
     try:
-        if 'file' not in request.files:
-            logger.error("No file part in the request")
-            return jsonify({"error": "No file provided"}), 400
-        file = request.files['file']
-        if file.filename == '':
-            logger.error("No file selected")
-            return jsonify({"error": "No file selected"}), 400
-        
-        if not file.filename.endswith(('.wav', '.mp3')):
-            logger.error("Unsupported file format")
-            return jsonify({"error": "Unsupported file format"}), 400
+        logger.info("Loading ASR model '%s' on %s", MODEL_NAME, device)
+        asr_pipe = pipeline(PIPELINE_TASK, model=MODEL_NAME, device=device)
+        try:
+            forced = asr_pipe.tokenizer.get_decoder_prompt_ids(language="de", task="transcribe")
+            asr_pipe.model.config.forced_decoder_ids = forced
+        except Exception:
+            logger.warning("Forced decoder ids not set")
+        logger.info("ASR model ready")
+        return asr_pipe
+    except Exception:
+        logger.exception("ASR model load failed")
+        raise RuntimeError("Model initialization failed")
 
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            audio_path = os.path.join(tmpdirname, file.filename)
-            file.save(audio_path)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    load_keywords()
+    try:
+        get_asr_pipeline()
+    except Exception:
+        pass  # keep service up for /health
+    yield
+    # Shutdown (nothing needed now)
 
-            logger.info(f"File saved to {audio_path}")
-            convert_start_time = time.time()
-            audio = AudioSegment.from_file(audio_path)
-            audio.export(audio_path, format="wav")
-            logger.info(f"Audio conversion time: {time.time() - convert_start_time}")
+app = FastAPI(title="Voicebot ASR", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
 
-            transcribe_start_time = time.time()
-            text = transcribe_audio(audio_path)
-            logger.info(f"Transcription time: {time.time() - transcribe_start_time}")
+def detect_keywords(text: str) -> List[str]:
+    found: List[str] = []
+    for token in word_pattern.findall(text.lower()):
+        if token in keyword_set and token not in found:
+            found.append(token)
+    return found
 
-            detect_start_time = time.time()
-            detected_keywords = detect_keywords(text)
-            logger.info(f"Keyword detection time: {time.time() - detect_start_time}")
+def validate_file_meta(upload: UploadFile) -> None:
+    ext = os.path.splitext(upload.filename or "")[1].lower()
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(status_code=400, detail="Unsupported file extension")
 
-            total_time = time.time() - start_time
-            logger.info(f"Total processing time: {total_time}")
+def ensure_size_limit(size_bytes: int) -> None:
+    if size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large")
 
-            return jsonify({"text": text, "keywords": detected_keywords})
-    except Exception as e:
-        logger.error(f"Error in /transcribe endpoint: {e}")
-        return jsonify({"error": "Internal Server Error"}), 500
+@app.get("/health", response_model=HealthResponse)
+def health():
+    return HealthResponse(status="ok", model=MODEL_NAME, device=str(device))
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+@app.get("/keywords", response_model=KeywordsResponse)
+def list_keywords():
+    return KeywordsResponse(keywords=sorted(keywords_raw))
+
+@app.post("/transcribe", response_model=TranscribeResponse)
+async def transcribe(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Empty filename")
+
+    validate_file_meta(file)
+
+    start = time.time()
+    try:
+        contents = await file.read()
+        ensure_size_limit(len(contents))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_path = os.path.join(tmpdir, file.filename)
+            with open(raw_path, "wb") as f:
+                f.write(contents)
+
+            conv_start = time.time()
+            audio = AudioSegment.from_file(raw_path)
+            wav_path = os.path.join(tmpdir, "audio.wav")
+            audio.export(wav_path, format="wav")
+            conv_time = time.time() - conv_start
+
+            asr_start = time.time()
+            pipe = get_asr_pipeline()
+            result = pipe(wav_path)
+            text = result.get("text", "").strip()
+            asr_time = time.time() - asr_start
+
+            kw_start = time.time()
+            detected = detect_keywords(text)
+            kw_time = time.time() - kw_start
+
+        total = time.time() - start
+        return TranscribeResponse(
+            text=text,
+            keywords=detected,
+            timings={
+                "conversion_sec": round(conv_time, 3),
+                "asr_sec": round(asr_time, 3),
+                "keyword_sec": round(kw_time, 3),
+                "total_sec": round(total, 3),
+            },
+        )
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Transcription failed")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+

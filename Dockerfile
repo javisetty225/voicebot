@@ -1,23 +1,21 @@
-FROM python:3.9-slim
+FROM python:3.12-slim
 
-# Avoid Python buffering logs
-ENV PYTHONUNBUFFERED=1 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
-
-# Install system dependencies (FFmpeg is needed by pydub / audio processing)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+# System deps (add ffmpeg if pydub needs it)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Copy entire project into the image
-COPY . .
+COPY pyproject.toml README.md ./
+COPY backend backend
+COPY frontend frontend
 
-# Default command (can be overridden by docker-compose)
-# Here we default to the backend; docker-compose will override for each service.
-CMD ["python", "backend/api_server.py"]
+RUN pip install --upgrade pip && pip install .  # installs project deps
+
+EXPOSE 8000 8501
+
+# Default to API (override for Streamlit)
+CMD ["uvicorn", "backend.api_server:app", "--host", "0.0.0.0", "--port", "8000"]
