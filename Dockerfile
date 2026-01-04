@@ -10,8 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -r
 
 COPY pyproject.toml pyproject.toml
 COPY README.md README.md
-COPY src backend
-COPY user_demo frontend
+COPY src src
 
 RUN pip install --upgrade pip && pip install .
 
