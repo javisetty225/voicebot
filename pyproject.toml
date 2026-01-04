@@ -7,7 +7,7 @@ name = "voicebot"
 version = "0.1.0"
 description = "German speech transcription and keyword detection voicebot with FastAPI backend and Streamlit frontend."
 readme = "README.md"
-requires-python = "==3.12.10"
+requires-python = "==3.12.12"
 authors = [
   { name = "Nagaraju Javisetty", email = "nagajavisetty143@gmail.com" }
 ]
